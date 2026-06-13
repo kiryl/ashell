@@ -466,6 +466,7 @@ mod tests {
             name: name.to_string(),
             active_workspace_id,
             special_workspace_id: -1,
+            logical_size: None,
         }
     }
 

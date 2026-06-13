@@ -255,6 +255,7 @@ impl GenericState {
                     name: o.name.clone(),
                     active_workspace_id: active,
                     special_workspace_id: -1,
+                    logical_size: None,
                 }
             })
             .collect();
