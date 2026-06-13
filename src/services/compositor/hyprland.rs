@@ -229,6 +229,7 @@ fn fetch_full_state(internal_state: &HyprInternalState) -> Result<CompositorStat
             active_workspace_id: m.active_workspace.id,
             special_workspace_id: m.special_workspace.id,
             logical_size: None,
+            view_point: None,
         })
         .collect();
 

@@ -272,6 +272,14 @@ fn map_state(niri: &EventStreamState, outputs: &HashMap<String, (u32, u32)>) -> 
             active_workspace_id: output_to_active_ws.get(*name).copied().unwrap_or(-1),
             special_workspace_id: -1,
             logical_size: outputs.get(*name).copied(),
+            // The output's view point is its active workspace's scrolling
+            // view position (forked niri-ipc); vertical is always 0.
+            view_point: niri
+                .workspaces
+                .workspaces
+                .values()
+                .find(|ws| ws.is_active && ws.output.as_ref() == Some(*name))
+                .map(|ws| (ws.scrolling_view_pos as f32, 0.0)),
         })
         .collect();
 
@@ -314,6 +322,18 @@ fn map_state(niri: &EventStreamState, outputs: &HashMap<String, (u32, u32)>) -> 
                     .map(|(c, r)| (c as u32, r as u32)),
                 tile_width: w.layout.tile_size.0 as f32,
                 tile_height: w.layout.tile_size.1 as f32,
+                // Floating position is viewport-relative in the IPC; add the
+                // workspace's scrolling view offset to get workspace-layout
+                // coordinates (forked niri-ipc).
+                floating_pos: if w.is_floating {
+                    w.layout.tile_pos_in_workspace_view.and_then(|(tx, ty)| {
+                        w.workspace_id
+                            .and_then(|wid| niri.workspaces.workspaces.get(&wid))
+                            .map(|ws| ((tx + ws.scrolling_view_pos) as f32, ty as f32))
+                    })
+                } else {
+                    None
+                },
             }
         })
         .collect();

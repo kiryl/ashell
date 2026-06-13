@@ -79,7 +79,7 @@ inotify = { version = "0.11.1", default-features = false, features = [
   "stream",
 ] }
 pin-project-lite = "0.2.16"
-niri-ipc = "26.4"
+niri-ipc = { git = "https://github.com/kiryl/niri", rev = "d26ab5f29df6" }
 reqwest = { version = "0.13", default-features = false, features = [
   "json",
   "rustls",
