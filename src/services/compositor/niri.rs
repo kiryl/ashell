@@ -10,7 +10,7 @@ use niri_ipc::{
     state::{EventStreamState, EventStreamStatePart},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     os::unix::net::UnixStream as StdUnixStream,
 };
@@ -279,6 +279,38 @@ fn tabbed_columns(
         .collect()
 }
 
+/// The x of a workspace's view onto its scrolling layout, in the minimap's
+/// workspace-layout space: columns laid side by side, each as wide as its
+/// widest tile, column 1 at x = 0. Tiled windows are given as
+/// `(column index, tile width, x within the view)`.
+///
+/// niri reports a tiled window's position within the view only while the
+/// window is on screen, so one visible window anchors the view: its column's
+/// x minus its x in the view. The leftmost visible column is used; the
+/// minimap leaves out the gaps niri puts between columns, so the anchor is
+/// exact and the error grows only to its right. An empty layout has its view
+/// at 0. `None` when no tiled window reports a position, as with niri
+/// releases that predate niri-wm/niri#4711.
+fn scrolling_view_x(tiles: impl IntoIterator<Item = (usize, f64, Option<f64>)>) -> Option<f64> {
+    let mut columns: BTreeMap<usize, (f64, Option<f64>)> = BTreeMap::new();
+    for (col, width, view_x) in tiles {
+        let (w, x) = columns.entry(col).or_default();
+        *w = w.max(width);
+        *x = x.or(view_x);
+    }
+    if columns.is_empty() {
+        return Some(0.0);
+    }
+    let mut col_x = 0.0;
+    for (w, view_x) in columns.into_values() {
+        if let Some(x) = view_x {
+            return Some(col_x - x);
+        }
+        col_x += w;
+    }
+    None
+}
+
 fn map_state(niri: &EventStreamState, outputs: &HashMap<String, (u32, u32)>) -> CompositorState {
     let output_to_active_ws: HashMap<_, _> = niri
         .workspaces
@@ -366,6 +398,27 @@ fn map_state(niri: &EventStreamState, outputs: &HashMap<String, (u32, u32)>) -> 
         }
     }
 
+    // Scrolling view position of every workspace, in the minimap's
+    // workspace-layout space (column 1 at x = 0).
+    let view_x: HashMap<u64, Option<f64>> = niri
+        .workspaces
+        .workspaces
+        .keys()
+        .map(|&wid| {
+            let tiles = niri.windows.windows.values().filter_map(|w| {
+                let (col, _) = w.layout.pos_in_scrolling_layout?;
+                (w.workspace_id == Some(wid)).then(|| {
+                    (
+                        col,
+                        w.layout.tile_size.0,
+                        w.layout.tile_pos_in_workspace_view.map(|(x, _)| x),
+                    )
+                })
+            });
+            (wid, scrolling_view_x(tiles))
+        })
+        .collect();
+
     let monitors: Vec<CompositorMonitor> = outputs_sorted
         .iter()
         .enumerate()
@@ -377,6 +430,12 @@ fn map_state(niri: &EventStreamState, outputs: &HashMap<String, (u32, u32)>) -> 
             active_workspace_name: String::new(),
             special_workspace_name: String::new(),
             logical_size: outputs.get(*name).copied(),
+            // The output's view point is its active workspace's scrolling
+            // view position; vertical is always 0.
+            view_point: output_to_active_ws
+                .get(*name)
+                .and_then(|&wid| view_x.get(&(wid as u64)).copied().flatten())
+                .map(|x| (x as f32, 0.0)),
         })
         .collect();
 
@@ -440,6 +499,18 @@ fn map_state(niri: &EventStreamState, outputs: &HashMap<String, (u32, u32)>) -> 
                 tab_index,
                 tile_width: w.layout.tile_size.0 as f32,
                 tile_height: w.layout.tile_size.1 as f32,
+                // Floating position is viewport-relative in the IPC; add the
+                // workspace's scrolling view offset to get workspace-layout
+                // coordinates.
+                floating_pos: if w.is_floating {
+                    w.layout.tile_pos_in_workspace_view.and_then(|(tx, ty)| {
+                        w.workspace_id
+                            .and_then(|wid| view_x.get(&wid).copied().flatten())
+                            .map(|vx| ((tx + vx) as f32, ty as f32))
+                    })
+                } else {
+                    None
+                },
             }
         })
         .collect();
@@ -476,6 +547,37 @@ mod tests {
 
     fn detect(tiles: &[(u64, usize, f64)], output_h: Option<f64>) -> HashSet<(u64, usize)> {
         tabbed_columns(tiles.iter().copied(), |_| output_h)
+    }
+
+    #[test]
+    fn view_x_anchored_on_leftmost_visible_column() {
+        // Columns 1 and 2 scrolled off to the left; column 3 starts 20px into
+        // the view, column 4 further right.
+        let tiles = [
+            (1, 800.0, None),
+            (2, 600.0, None),
+            (2, 400.0, None),
+            (3, 500.0, Some(20.0)),
+            (4, 500.0, Some(536.0)),
+        ];
+        assert_eq!(scrolling_view_x(tiles), Some(1400.0 - 20.0));
+    }
+
+    #[test]
+    fn view_x_left_of_first_column() {
+        // Gap (and centering) space left of column 1 puts the view at a
+        // negative x.
+        assert_eq!(scrolling_view_x([(1, 800.0, Some(16.0))]), Some(-16.0));
+    }
+
+    #[test]
+    fn view_x_of_empty_layout_is_zero() {
+        assert_eq!(scrolling_view_x([]), Some(0.0));
+    }
+
+    #[test]
+    fn view_x_unknown_without_reported_positions() {
+        assert_eq!(scrolling_view_x([(1, 800.0, None)]), None);
     }
 
     #[test]

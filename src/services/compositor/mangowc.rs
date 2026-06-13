@@ -197,6 +197,7 @@ fn build_state(all: AllMonitors) -> CompositorState {
             active_workspace_name: String::new(),
             special_workspace_name: String::new(),
             logical_size: None,
+            view_point: None,
         });
 
         // Prefer the focused monitor's data, else the first that has any.
