@@ -55,22 +55,36 @@
         src =
           let
             assetsFilter = path: _type: builtins.match ".*assets/.*" path != null;
-            i18nFilter =
-              path: _type: builtins.match ".*(i18n\\.toml|i18n/.*)" path != null;
+            i18nFilter = path: _type: builtins.match ".*(i18n\\.toml|i18n/.*)" path != null;
             srcFilter =
               path: type:
-              (assetsFilter path type)
-              || (i18nFilter path type)
-              || (craneLib.filterCargoSources path type);
+              (assetsFilter path type) || (i18nFilter path type) || (craneLib.filterCargoSources path type);
           in
           pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = srcFilter;
           };
 
+        # The niri-ipc git dependency checks out the whole niri repo, which
+        # mirrors niri's GitHub wiki under docs/wiki/ with ':' in the file
+        # names (e.g. "Configuration:-Input.md"). Nix can't store such paths,
+        # so vendoring the checkout fails. The crate doesn't need docs/, so
+        # strip it before the checkout is packaged.
+        cargoVendorDir = craneLib.vendorCargoDeps {
+          inherit src;
+          overrideVendorGitCheckout =
+            ps: drv:
+            if builtins.any (p: builtins.match ".*kiryl/niri.*" (p.source or "") != null) ps then
+              drv.overrideAttrs (old: {
+                preInstall = (old.preInstall or "") + "\nrm -rf docs\n";
+              })
+            else
+              drv;
+        };
+
         # Shared build arguments for both deps and final build
         commonArgs = {
-          inherit src;
+          inherit src cargoVendorDir;
           strictDeps = true;
           nativeBuildInputs = with pkgs; [
             makeWrapper
