@@ -196,6 +196,7 @@ fn build_state(all: AllMonitors) -> CompositorState {
             active_workspace_id: selected_ids.first().copied().unwrap_or(-1),
             active_workspace_name: String::new(),
             special_workspace_name: String::new(),
+            logical_size: None,
         });
 
         // Prefer the focused monitor's data, else the first that has any.

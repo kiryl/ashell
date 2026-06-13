@@ -257,6 +257,7 @@ impl GenericState {
                     active_workspace_id: active,
                     active_workspace_name: String::new(),
                     special_workspace_name: String::new(),
+                    logical_size: None,
                 }
             })
             .collect();
