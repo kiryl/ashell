@@ -56,12 +56,12 @@ Displays the title of the currently focused window.
 
 ### Minimap
 
-Shows a small map of the tiled windows on the active workspace, laid out
-by column and row with proportional sizes, with the focused tile
-highlighted and urgent windows shown in the danger color. Floating
-windows have no grid position and aren't shown. On Hyprland the widget
-stays hidden because the compositor doesn't expose enough per-window
-layout info.
+Shows a small map of the windows on the active workspace, laid out
+spatially: tiled windows by column and row with proportional sizes,
+floating windows placed in the workspace, and the on-screen viewport
+drawn as an outlined rectangle. The focused window is highlighted and
+urgent windows use the danger color. On Hyprland the widget stays hidden
+because the compositor doesn't expose enough per-window layout info.
 
 ### SystemInfo
 

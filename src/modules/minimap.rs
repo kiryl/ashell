@@ -7,7 +7,7 @@ use iced::{
     mouse::Cursor,
     widget::{
         canvas,
-        canvas::{Frame, Geometry, Program},
+        canvas::{Frame, Geometry, Path, Program, Stroke},
         container,
     },
 };
@@ -20,6 +20,8 @@ const MIN_TILE: f32 = 2.0;
 // Gap carved out of a tile's edge where it abuts a neighbour, so adjacent
 // same-colour tiles don't merge into one block.
 const TILE_GAP: f32 = 1.0;
+const VIEWPORT_STROKE_W: f32 = 1.0;
+const FLOATING_STROKE_W: f32 = 1.0;
 // Tolerance for "shared edge" — coordinates come from compositor floats, so
 // allow sub-pixel slack.
 const EPS: f32 = 0.5;
@@ -66,7 +68,7 @@ impl Minimap {
             .filter(|w| w.workspace_id == Some(active_id))
             .collect();
 
-        let minimap = build_canvas(&windows)?;
+        let minimap = build_canvas(&windows, viewport_rect(service, active_id))?;
 
         let (w, h) = (minimap.width, minimap.height);
         Some(
@@ -83,6 +85,17 @@ impl Minimap {
     pub fn subscription(&self) -> Subscription<Message> {
         CompositorService::subscribe().map(Message::ServiceEvent)
     }
+}
+
+/// The output's on-screen viewport, in workspace-layout coordinates:
+/// `(view_point.x, view_point.y, width, height)`. `None` unless the
+/// compositor exposes both the view point and the monitor's logical size.
+fn viewport_rect(service: &CompositorService, ws_id: i32) -> Option<Rect> {
+    let ws = service.workspaces.iter().find(|w| w.id == ws_id)?;
+    let mon = service.monitors.iter().find(|m| m.name == ws.monitor)?;
+    let (px, py) = mon.view_point?;
+    let (w, h) = mon.logical_size?;
+    Some((px, py, w as f32, h as f32))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +124,15 @@ fn tile_color(role: TileRole, theme: &Theme) -> Color {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum Shape {
+    /// Tiled window: a filled rectangle, inset on sides with a neighbour.
+    Tile,
+    /// Floating window placed in the layout: filled rectangle with a halo,
+    /// drawn on top of the tiling.
+    Floating,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct CanvasTile {
     x: f32,
     y: f32,
@@ -119,11 +141,13 @@ struct CanvasTile {
     inset_r: f32,
     inset_b: f32,
     role: TileRole,
+    shape: Shape,
 }
 
 /// A fully positioned minimap, in canvas (post-scale) pixel coordinates.
 struct MinimapCanvas {
     tiles: Vec<CanvasTile>,
+    viewport: Option<Rect>,
     width: f32,
     height: f32,
 }
@@ -141,15 +165,59 @@ impl<Message> Program<Message> for MinimapCanvas {
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
 
-        // Tiled windows. Insets shrink a tile only on sides with a neighbour,
-        // so adjacent tiles stay separated while outer edges stay flush.
+        // Base layer: tiled windows. Insets shrink a tile only on sides with
+        // a neighbour, so adjacent tiles stay separated while outer edges stay
+        // flush with the viewport.
         for t in &self.tiles {
+            if !matches!(t.shape, Shape::Tile) {
+                continue;
+            }
             frame.fill_rectangle(
                 Point::new(t.x, t.y),
                 Size::new(
                     (t.w - t.inset_r).max(MIN_TILE),
                     (t.h - t.inset_b).max(MIN_TILE),
                 ),
+                tile_color(t.role, theme),
+            );
+        }
+
+        // Viewport outline over the tiles. Stroked rectangles centre the
+        // stroke on the path, so nudge the rect inward to keep it aligned
+        // with the canvas extent.
+        if let Some((vx, vy, vw, vh)) = self.viewport {
+            let inset = VIEWPORT_STROKE_W / 2.0;
+            let path = Path::rectangle(
+                Point::new(vx + inset, vy + inset),
+                Size::new(
+                    (vw - VIEWPORT_STROKE_W).max(0.0),
+                    (vh - VIEWPORT_STROKE_W).max(0.0),
+                ),
+            );
+            frame.stroke(
+                &path,
+                Stroke::default()
+                    .with_width(VIEWPORT_STROKE_W)
+                    .with_color(theme.palette().text),
+            );
+        }
+
+        // Floating windows on top of everything. A halo in the canvas
+        // background colour separates the floating fill from inactive tiles
+        // beneath it, which would otherwise share the same colour and merge.
+        let halo = theme.extended_palette().background.base.color;
+        for t in &self.tiles {
+            if !matches!(t.shape, Shape::Floating) {
+                continue;
+            }
+            frame.fill_rectangle(
+                Point::new(t.x - FLOATING_STROKE_W, t.y - FLOATING_STROKE_W),
+                Size::new(t.w + 2.0 * FLOATING_STROKE_W, t.h + 2.0 * FLOATING_STROKE_W),
+                halo,
+            );
+            frame.fill_rectangle(
+                Point::new(t.x, t.y),
+                Size::new(t.w, t.h),
                 tile_color(t.role, theme),
             );
         }
@@ -202,55 +270,95 @@ fn layout_tiled<'a>(tiled: &[&'a CompositorWindow]) -> Vec<(Rect, &'a Compositor
     placed
 }
 
-/// Build the minimap from the workspace's tiled windows, laid out by grid
-/// index and scaled to fit. Floating windows have no grid position and aren't
-/// rendered; showing them may be explored later, once niri exposes enough
-/// information to place them. Returns `None` when there are no tiled windows
-/// to draw.
-fn build_canvas(windows: &[&CompositorWindow]) -> Option<MinimapCanvas> {
+/// Build the minimap in one workspace-layout coordinate space: tiled windows
+/// from their grid index, floating windows from their absolute `floating_pos`,
+/// and the output's viewport drawn as an outlined rectangle. Returns `None`
+/// only when there are neither windows nor a viewport to draw.
+fn build_canvas(windows: &[&CompositorWindow], viewport: Option<Rect>) -> Option<MinimapCanvas> {
     let tiled: Vec<&CompositorWindow> =
         windows.iter().copied().filter(|w| !w.is_floating).collect();
     let placed = layout_tiled(&tiled);
-    if placed.is_empty() {
+
+    // Layout-space rects tagged with how to draw them.
+    let mut items: Vec<(Rect, TileRole, Shape)> = placed
+        .iter()
+        .map(|(r, w)| (*r, role_of(w), Shape::Tile))
+        .collect();
+    for w in windows.iter().copied().filter(|w| w.is_floating) {
+        if let Some((x, y)) = w.floating_pos {
+            items.push((
+                (x, y, w.tile_width, w.tile_height),
+                role_of(w),
+                Shape::Floating,
+            ));
+        }
+    }
+    // Nothing to draw only when there are no windows and no viewport; an empty
+    // workspace still shows its viewport rectangle.
+    if items.is_empty() && viewport.is_none() {
         return None;
     }
 
-    let rects: Vec<Rect> = placed.iter().map(|(r, _)| *r).collect();
-    let layout_w = rects
-        .iter()
-        .map(|r| r.0 + r.2)
-        .fold(0.0_f32, f32::max)
-        .max(1.0);
-    let layout_h = rects
-        .iter()
-        .map(|r| r.1 + r.3)
-        .fold(0.0_f32, f32::max)
-        .max(1.0);
+    // Bounding box over everything placed in layout space (windows + viewport).
+    let mut bounds: Vec<Rect> = items.iter().map(|(r, _, _)| *r).collect();
+    bounds.extend(viewport);
+    let min_x = bounds.iter().map(|r| r.0).fold(f32::MAX, f32::min);
+    let min_y = bounds.iter().map(|r| r.1).fold(f32::MAX, f32::min);
+    let max_x = bounds.iter().map(|r| r.0 + r.2).fold(f32::MIN, f32::max);
+    let max_y = bounds.iter().map(|r| r.1 + r.3).fold(f32::MIN, f32::max);
+    let layout_w = (max_x - min_x).max(1.0);
+    let layout_h = (max_y - min_y).max(1.0);
     let scale = (MAX_H / layout_h).min(MAX_W / layout_w);
 
-    let tiles: Vec<CanvasTile> = placed
+    let tiled_rects: Vec<Rect> = items
         .iter()
-        .map(|&((x, y, w, h), win)| CanvasTile {
-            x: x * scale,
-            y: y * scale,
-            w: (w * scale).max(MIN_TILE),
-            h: (h * scale).max(MIN_TILE),
-            inset_r: if has_neighbor_right(&rects, x, y, w, h) {
-                TILE_GAP
-            } else {
-                0.0
-            },
-            inset_b: if has_neighbor_below(&rects, x, y, w, h) {
-                TILE_GAP
-            } else {
-                0.0
-            },
-            role: role_of(win),
+        .filter(|(_, _, s)| matches!(s, Shape::Tile))
+        .map(|(r, _, _)| *r)
+        .collect();
+
+    let tiles: Vec<CanvasTile> = items
+        .iter()
+        .map(|&((x, y, w, h), role, shape)| {
+            let (inset_r, inset_b) = match shape {
+                Shape::Tile => (
+                    if has_neighbor_right(&tiled_rects, x, y, w, h) {
+                        TILE_GAP
+                    } else {
+                        0.0
+                    },
+                    if has_neighbor_below(&tiled_rects, x, y, w, h) {
+                        TILE_GAP
+                    } else {
+                        0.0
+                    },
+                ),
+                Shape::Floating => (0.0, 0.0),
+            };
+            CanvasTile {
+                x: (x - min_x) * scale,
+                y: (y - min_y) * scale,
+                w: (w * scale).max(MIN_TILE),
+                h: (h * scale).max(MIN_TILE),
+                inset_r,
+                inset_b,
+                role,
+                shape,
+            }
         })
         .collect();
 
+    let viewport = viewport.map(|(x, y, w, h)| {
+        (
+            (x - min_x) * scale,
+            (y - min_y) * scale,
+            w * scale,
+            h * scale,
+        )
+    });
+
     Some(MinimapCanvas {
         tiles,
+        viewport,
         width: (layout_w * scale).max(1.0),
         height: (layout_h * scale).max(1.0),
     })
