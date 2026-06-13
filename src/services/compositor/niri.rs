@@ -6,10 +6,10 @@ use crate::services::ServiceEvent;
 use anyhow::{Context, Result, anyhow};
 use itertools::Itertools;
 use niri_ipc::{
-    Action, Event, Reply, Request, WorkspaceReferenceArg,
+    Action, Event, Reply, Request, Response, WorkspaceReferenceArg,
     state::{EventStreamState, EventStreamStatePart},
 };
-use std::{env, os::unix::net::UnixStream as StdUnixStream};
+use std::{collections::HashMap, env, os::unix::net::UnixStream as StdUnixStream};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -95,6 +95,11 @@ pub async fn run_listener(tx: &broadcast::Sender<ServiceEvent<CompositorService>
 
     let mut internal_state = EventStreamState::default();
 
+    // Outputs aren't part of the event stream, so fetch them up front and
+    // refresh whenever a workspace references an output we don't know yet
+    // (which covers monitor hotplug).
+    let mut outputs = fetch_outputs().await.unwrap_or_default();
+
     // 6. Loop forever using the SAME reader
     loop {
         line.clear();
@@ -120,11 +125,22 @@ pub async fn run_listener(tx: &broadcast::Sender<ServiceEvent<CompositorService>
             }
         };
 
+        let need_outputs_refresh = match &event {
+            Event::WorkspacesChanged { workspaces } => workspaces
+                .iter()
+                .any(|w| w.output.as_ref().is_some_and(|o| !outputs.contains_key(o))),
+            _ => false,
+        };
+
         // Apply to internal Niri state tracker
         internal_state.apply(event);
 
+        if need_outputs_refresh && let Ok(fresh) = fetch_outputs().await {
+            outputs = fresh;
+        }
+
         // Map to generic Ashell state
-        let state = map_state(&internal_state);
+        let state = map_state(&internal_state, &outputs);
 
         // Emit Update
         let _ = tx.send(ServiceEvent::Update(CompositorEvent::StateChanged(
@@ -133,6 +149,31 @@ pub async fn run_listener(tx: &broadcast::Sender<ServiceEvent<CompositorService>
     }
 
     Ok(())
+}
+
+async fn fetch_outputs() -> Result<HashMap<String, (u32, u32)>> {
+    let mut stream = connect().await?;
+
+    let request_json = serde_json::to_string(&Request::Outputs)? + "\n";
+    stream.write_all(request_json.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).await?;
+
+    let reply: Reply = serde_json::from_str(&response_line).context("parse outputs reply")?;
+    let response = reply.map_err(|e| anyhow!("Niri error fetching outputs: {}", e))?;
+    match response {
+        Response::Outputs(outputs) => Ok(outputs
+            .into_iter()
+            .filter_map(|(name, out)| out.logical.map(|l| (name, (l.width, l.height))))
+            .collect()),
+        other => Err(anyhow!(
+            "Unexpected response to Outputs request: {:?}",
+            other
+        )),
+    }
 }
 
 async fn connect() -> Result<UnixStream> {
@@ -159,7 +200,7 @@ async fn send_command_request(stream: &mut UnixStream, request: Request) -> Resu
     reply.map_err(|e| anyhow!("Niri error: {}", e)).map(|_| ())
 }
 
-fn map_state(niri: &EventStreamState) -> CompositorState {
+fn map_state(niri: &EventStreamState, outputs: &HashMap<String, (u32, u32)>) -> CompositorState {
     let output_to_active_ws: std::collections::HashMap<_, _> = niri
         .workspaces
         .workspaces
@@ -230,6 +271,7 @@ fn map_state(niri: &EventStreamState) -> CompositorState {
             name: (*name).clone(),
             active_workspace_id: output_to_active_ws.get(*name).copied().unwrap_or(-1),
             special_workspace_id: -1,
+            logical_size: outputs.get(*name).copied(),
         })
         .collect();
 
@@ -257,20 +299,22 @@ fn map_state(niri: &EventStreamState) -> CompositorState {
         .windows
         .windows
         .values()
-        .map(|w| CompositorWindow {
-            id: w.id,
-            workspace_id: w
-                .workspace_id
-                .and_then(|wid| niri.workspaces.workspaces.get(&wid).map(|ws| ws.id as i32)),
-            is_focused: w.is_focused,
-            is_floating: w.is_floating,
-            is_urgent: w.is_urgent,
-            tile_position: w
-                .layout
-                .pos_in_scrolling_layout
-                .map(|(c, r)| (c as u32, r as u32)),
-            tile_width: w.layout.tile_size.0 as f32,
-            tile_height: w.layout.tile_size.1 as f32,
+        .map(|w| {
+            CompositorWindow {
+                id: w.id,
+                workspace_id: w
+                    .workspace_id
+                    .and_then(|wid| niri.workspaces.workspaces.get(&wid).map(|ws| ws.id as i32)),
+                is_focused: w.is_focused,
+                is_floating: w.is_floating,
+                is_urgent: w.is_urgent,
+                tile_position: w
+                    .layout
+                    .pos_in_scrolling_layout
+                    .map(|(c, r)| (c as u32, r as u32)),
+                tile_width: w.layout.tile_size.0 as f32,
+                tile_height: w.layout.tile_size.1 as f32,
+            }
         })
         .collect();
 

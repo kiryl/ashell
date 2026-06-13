@@ -16,6 +16,9 @@ pub struct CompositorMonitor {
     pub name: String,
     pub active_workspace_id: i32,
     pub special_workspace_id: i32,
+    /// Logical size of the monitor in compositor pixels, if known. Used by
+    /// the minimap to size the on-screen viewport.
+    pub logical_size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

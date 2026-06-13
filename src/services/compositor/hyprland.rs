@@ -228,6 +228,7 @@ fn fetch_full_state(internal_state: &HyprInternalState) -> Result<CompositorStat
             name: m.name,
             active_workspace_id: m.active_workspace.id,
             special_workspace_id: m.special_workspace.id,
+            logical_size: None,
         })
         .collect();
 
