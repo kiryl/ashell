@@ -56,10 +56,11 @@ Displays the title of the currently focused window.
 
 ### Minimap
 
-Shows a small map of the tiled windows on the workspace active on the
-bar's output, laid out by column and row with proportional sizes, with
-the focused tile highlighted and urgent windows shown in the danger
-color. Floating windows have no grid position and aren't shown.
+Shows a small map of the windows on the workspace active on the bar's
+output, laid out spatially: tiled windows by column and row with
+proportional sizes, floating windows placed in the workspace, and the
+on-screen viewport drawn as an outlined rectangle. The focused window
+is highlighted and urgent windows use the danger color.
 
 A tabbed column is drawn as a single tile with a strip of tab segments
 on its left edge. When the column has focus, the tile and the focused
@@ -70,6 +71,10 @@ size.
 
 Only the Niri backend provides the window layout today; on other
 compositors the module stays hidden.
+
+The viewport and floating windows need a niri newer than 26.04, which
+reports where tiled windows sit on screen; with older versions they are
+drawn only on an empty workspace.
 
 ### SystemInfo
 
