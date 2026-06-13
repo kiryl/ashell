@@ -256,6 +256,7 @@ impl GenericState {
                     active_workspace_id: active,
                     special_workspace_id: -1,
                     logical_size: None,
+                    view_point: None,
                 }
             })
             .collect();

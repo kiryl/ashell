@@ -458,6 +458,7 @@ mod tests {
             tile_position: Some((col, row)),
             tile_width: w,
             tile_height: h,
+            floating_pos: None,
             tab_index: None,
         }
     }
@@ -557,6 +558,7 @@ mod tests {
             name: name.to_string(),
             active_workspace_id,
             special_workspace_id: -1,
+            view_point: None,
             logical_size: None,
         }
     }
