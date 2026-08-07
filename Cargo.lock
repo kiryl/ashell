@@ -2799,7 +2799,7 @@ dependencies = [
 [[package]]
 name = "niri-ipc"
 version = "26.4.0"
-source = "git+https://github.com/kiryl/niri?rev=d26ab5f29df6#d26ab5f29df670110a91a7e933a743eeaf611978"
+source = "git+https://github.com/kiryl/niri?rev=47adc1558d16#47adc1558d1605b478541b2a47757b8748234e3c"
 dependencies = [
  "serde",
  "serde_json",
