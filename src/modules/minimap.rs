@@ -28,6 +28,9 @@ const MIN_TILE: f32 = 2.0;
 // Gap carved out of a tile's edge where it abuts a neighbour, so adjacent
 // same-colour tiles don't merge into one block.
 const TILE_GAP: f32 = 1.0;
+// Width of the tab strip drawn on the left edge of a tabbed tile, mirroring
+// niri's tab indicator. It's separated from the tile body by TILE_GAP.
+const TAB_STRIP_W: f32 = 2.0;
 
 /// An axis-aligned rectangle `(x, y, w, h)` in some 2D space.
 type Rect = (f32, f32, f32, f32);
@@ -182,7 +185,7 @@ fn tile_color(role: TileRole, theme: &Theme) -> Color {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CanvasTile {
     x: f32,
     y: f32,
@@ -191,6 +194,9 @@ struct CanvasTile {
     inset_r: f32,
     inset_b: f32,
     role: TileRole,
+    /// Roles of the tabs, top to bottom, when this tile is a tabbed slot;
+    /// empty otherwise.
+    tabs: Vec<TileRole>,
 }
 
 /// A fully positioned minimap, in canvas (post-scale) pixel coordinates.
@@ -224,9 +230,17 @@ impl<Message> Program<Message> for MinimapProgram<'_> {
             // stay flush. Tile sizes are already >= MIN_TILE from layout, so
             // the inset leaves at least a sliver visible.
             for t in &self.canvas.tiles {
+                let (w, h) = (t.w - t.inset_r, t.h - t.inset_b);
+                // A tabbed tile gets a strip of one segment per tab on its
+                // left edge, if it's wide enough to keep a body.
+                let strip = !t.tabs.is_empty() && w >= TAB_STRIP_W + TILE_GAP + MIN_TILE;
+                if strip {
+                    draw_tab_strip(frame, t.x, t.y, h, &t.tabs, theme);
+                }
+                let body_dx = if strip { TAB_STRIP_W + TILE_GAP } else { 0.0 };
                 frame.fill_rectangle(
-                    Point::new(t.x, t.y),
-                    Size::new(t.w - t.inset_r, t.h - t.inset_b),
+                    Point::new(t.x + body_dx, t.y),
+                    Size::new(w - body_dx, h),
                     tile_color(t.role, theme),
                 );
             }
@@ -236,21 +250,67 @@ impl<Message> Program<Message> for MinimapProgram<'_> {
     }
 }
 
+/// Draw a tabbed column's tab strip: `tabs.len()` segments stacked in a
+/// `TAB_STRIP_W`-wide column of height `h`, separated by TILE_GAP when there
+/// is room for it.
+fn draw_tab_strip(
+    frame: &mut canvas::Frame,
+    x: f32,
+    y: f32,
+    h: f32,
+    tabs: &[TileRole],
+    theme: &Theme,
+) {
+    let n = tabs.len() as f32;
+    let gap = if h - (n - 1.0) * TILE_GAP >= n {
+        TILE_GAP
+    } else {
+        0.0
+    };
+    let seg_h = (h - (n - 1.0) * gap) / n;
+    for (i, role) in tabs.iter().enumerate() {
+        frame.fill_rectangle(
+            Point::new(x, y + i as f32 * (seg_h + gap)),
+            Size::new(TAB_STRIP_W, seg_h),
+            tile_color(*role, theme),
+        );
+    }
+}
+
 /// A tile placed by [`layout_tiled`], with adjacency known by construction:
 /// a tile has a neighbour below unless it is the last in its column, and a
 /// neighbour to the right iff the next column reaches below the tile's top
 /// edge (all columns share it).
 struct PlacedTile<'a> {
     rect: Rect,
-    win: &'a CompositorWindow,
+    /// The tile's window, or every tab (top to bottom) of a tabbed slot.
+    wins: Vec<&'a CompositorWindow>,
     neighbor_right: bool,
     neighbor_below: bool,
+}
+
+impl PlacedTile<'_> {
+    fn is_tabbed(&self) -> bool {
+        self.wins.len() > 1
+    }
+
+    /// Role of the tile body. Which tab of an unfocused tabbed slot is
+    /// visible isn't known, so only focus colours a tabbed body; urgency
+    /// shows on the tab strip instead.
+    fn role(&self) -> TileRole {
+        match self.wins.as_slice() {
+            [w] => role_of(w),
+            tabs if tabs.iter().any(|w| w.is_focused) => TileRole::Focused,
+            _ => TileRole::Normal,
+        }
+    }
 }
 
 /// Lay tiled windows out left to right by column, top to bottom within a
 /// column, with positions derived from the grid index. Sizes are multiplied
 /// by `scale` and clamped to `min_size` before positions accumulate, so a
 /// clamped tile pushes its neighbours along instead of overlapping them.
+/// Tabs sharing a slot become a single tile carrying all of them.
 fn layout_tiled<'a>(
     tiled: &[&'a CompositorWindow],
     scale: f32,
@@ -262,14 +322,38 @@ fn layout_tiled<'a>(
         by_col.entry(col).or_default().push(w);
     }
     for tiles in by_col.values_mut() {
-        tiles.sort_by_key(|w| w.tile_position.map(|(_, r)| r).unwrap_or(0));
+        tiles.sort_by_key(|w| (w.tile_position.map(|(_, r)| r).unwrap_or(0), w.tab_index));
     }
-    let cols: Vec<Vec<&CompositorWindow>> = by_col.into_values().collect();
+    // Group each column into slots. Only tabs share a slot, so windows that
+    // merely collide on a position (e.g. both missing one) stay separate.
+    let cols: Vec<Vec<Vec<&CompositorWindow>>> = by_col
+        .into_values()
+        .map(|tiles| {
+            let mut slots: Vec<Vec<&CompositorWindow>> = Vec::new();
+            for w in tiles {
+                match slots.last_mut() {
+                    Some(slot)
+                        if w.tab_index.is_some()
+                            && slot[0].tab_index.is_some()
+                            && slot[0].tile_position == w.tile_position =>
+                    {
+                        slot.push(w)
+                    }
+                    _ => slots.push(vec![w]),
+                }
+            }
+            slots
+        })
+        .collect();
 
-    let tile_h = |w: &CompositorWindow| (w.tile_height.max(1.0) * scale).max(min_size);
+    // A tabbed tile is as tall as its tallest tab; they should all match.
+    let tile_h = |wins: &[&CompositorWindow]| {
+        let h = wins.iter().map(|w| w.tile_height).fold(0.0_f32, f32::max);
+        (h.max(1.0) * scale).max(min_size)
+    };
     let col_heights: Vec<f32> = cols
         .iter()
-        .map(|tiles| tiles.iter().map(|w| tile_h(w)).sum())
+        .map(|tiles| tiles.iter().map(|wins| tile_h(wins)).sum())
         .collect();
 
     let mut placed = Vec::new();
@@ -277,6 +361,7 @@ fn layout_tiled<'a>(
     for (i, tiles) in cols.iter().enumerate() {
         let col_w = (tiles
             .iter()
+            .flatten()
             .map(|w| w.tile_width)
             .fold(0.0_f32, f32::max)
             .max(1.0)
@@ -284,11 +369,11 @@ fn layout_tiled<'a>(
             .max(min_size);
         let next_col_h = col_heights.get(i + 1).copied().unwrap_or(0.0);
         let mut y = 0.0_f32;
-        for (j, w) in tiles.iter().enumerate() {
-            let h = tile_h(w);
+        for (j, wins) in tiles.iter().enumerate() {
+            let h = tile_h(wins);
             placed.push(PlacedTile {
                 rect: (x, y, col_w, h),
-                win: w,
+                wins: wins.clone(),
                 neighbor_right: next_col_h > y,
                 neighbor_below: j + 1 < tiles.len(),
             });
@@ -339,7 +424,12 @@ fn build_canvas(windows: &[&CompositorWindow]) -> Option<MinimapCanvas> {
                 h,
                 inset_r: if t.neighbor_right { TILE_GAP } else { 0.0 },
                 inset_b: if t.neighbor_below { TILE_GAP } else { 0.0 },
-                role: role_of(t.win),
+                role: t.role(),
+                tabs: if t.is_tabbed() {
+                    t.wins.iter().map(|w| role_of(w)).collect()
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect();
@@ -368,6 +458,7 @@ mod tests {
             tile_position: Some((col, row)),
             tile_width: w,
             tile_height: h,
+            tab_index: None,
         }
     }
 
@@ -548,5 +639,128 @@ mod tests {
         let refs: Vec<&CompositorWindow> = windows.iter().collect();
         assert!(build_canvas(&refs).is_none());
         assert!(build_canvas(&[]).is_none());
+    }
+
+    fn tab(id: u64, col: u32, row: u32, idx: u32, w: f32, h: f32) -> CompositorWindow {
+        CompositorWindow {
+            tab_index: Some(idx),
+            ..win(id, col, row, w, h)
+        }
+    }
+
+    // Tile sizes niri reports for a two-window column next to a one-window
+    // column, normal and tabbed.
+    fn normal_column() -> [CompositorWindow; 3] {
+        [
+            win(1, 0, 0, 831.0, 517.0),
+            win(2, 0, 1, 831.0, 516.0),
+            win(3, 1, 0, 831.0, 1041.0),
+        ]
+    }
+
+    fn tabbed_column() -> [CompositorWindow; 3] {
+        [
+            tab(1, 0, 0, 0, 831.0, 1041.0),
+            tab(2, 0, 0, 1, 831.0, 1041.0),
+            win(3, 1, 0, 831.0, 1041.0),
+        ]
+    }
+
+    #[test]
+    fn tabbed_column_collapses_to_one_tile() {
+        let windows = tabbed_column();
+        let placed = layout(&windows, 1.0, 0.0);
+
+        assert_eq!(placed.len(), 2);
+        assert!(placed[0].is_tabbed());
+        assert_eq!(placed[0].rect, (0.0, 0.0, 831.0, 1041.0));
+        assert!(!placed[0].neighbor_below);
+        assert!(placed[0].neighbor_right);
+        assert_eq!(placed[1].rect, (831.0, 0.0, 831.0, 1041.0));
+
+        // The same column stacked normally keeps both tiles.
+        assert_eq!(layout(&normal_column(), 1.0, 0.0).len(), 3);
+    }
+
+    #[test]
+    fn lone_tab_stays_a_plain_tile() {
+        // A slot with a single tab looks the same either way; no strip.
+        let windows = [tab(1, 0, 0, 0, 831.0, 1041.0)];
+        let placed = layout(&windows, 1.0, 0.0);
+        assert!(!placed[0].is_tabbed());
+    }
+
+    #[test]
+    fn tab_slot_within_a_stacked_column() {
+        // An i3/sway-style column: a window, a tab group of two, a window.
+        let windows = [
+            win(1, 0, 0, 100.0, 30.0),
+            tab(2, 0, 1, 0, 100.0, 40.0),
+            tab(3, 0, 1, 1, 100.0, 40.0),
+            win(4, 0, 2, 100.0, 30.0),
+        ];
+        let placed = layout(&windows, 1.0, 0.0);
+
+        assert_eq!(placed.len(), 3);
+        assert_eq!(placed[0].rect, (0.0, 0.0, 100.0, 30.0));
+        assert_eq!(placed[1].rect, (0.0, 30.0, 100.0, 40.0));
+        assert_eq!(placed[2].rect, (0.0, 70.0, 100.0, 30.0));
+        assert!(placed[1].is_tabbed());
+        assert!(placed[1].neighbor_below);
+        assert!(!placed[0].is_tabbed() && !placed[2].is_tabbed());
+    }
+
+    #[test]
+    fn tabs_ordered_by_tab_index() {
+        let windows = [
+            tab(1, 0, 0, 2, 100.0, 100.0),
+            tab(2, 0, 0, 0, 100.0, 100.0),
+            tab(3, 0, 0, 1, 100.0, 100.0),
+        ];
+        let placed = layout(&windows, 1.0, 0.0);
+        let ids: Vec<u64> = placed[0].wins.iter().map(|w| w.id).collect();
+        assert_eq!(ids, [2, 3, 1]);
+    }
+
+    #[test]
+    fn untabbed_windows_on_one_position_stay_separate() {
+        // Two windows without a grid position both default to (0, 0); they
+        // aren't tabs, so they stack rather than merge into one slot.
+        let mut a = win(1, 0, 0, 100.0, 50.0);
+        let mut b = win(2, 0, 0, 100.0, 50.0);
+        a.tile_position = None;
+        b.tile_position = None;
+        let windows = [a, b];
+        let placed = layout(&windows, 1.0, 0.0);
+        assert_eq!(placed.len(), 2);
+    }
+
+    #[test]
+    fn tabbed_body_colours_only_known_state() {
+        // The second tab is urgent but the column isn't focused: which tab is
+        // visible is unknown, so the body stays normal and the strip shows it.
+        let mut windows = tabbed_column();
+        windows[1].is_urgent = true;
+        let refs: Vec<&CompositorWindow> = windows.iter().collect();
+        let canvas = build_canvas(&refs).unwrap();
+
+        let tile = &canvas.tiles[0];
+        assert!(matches!(tile.role, TileRole::Normal));
+        assert!(matches!(
+            tile.tabs.as_slice(),
+            [TileRole::Normal, TileRole::Urgent]
+        ));
+        assert!(canvas.tiles[1].tabs.is_empty());
+
+        // Focus on a tab colours the body: the focused tab is the visible one.
+        windows[0].is_focused = true;
+        let refs: Vec<&CompositorWindow> = windows.iter().collect();
+        let canvas = build_canvas(&refs).unwrap();
+        let tile = &canvas.tiles[0];
+        assert!(matches!(tile.role, TileRole::Focused));
+        assert!(matches!(
+            tile.tabs.as_slice(),
+            [TileRole::Focused, TileRole::Urgent]
+        ));
     }
 }
